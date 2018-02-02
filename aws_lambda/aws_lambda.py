@@ -50,8 +50,7 @@ def cleanup_old_versions(
     if keep_last_versions <= 0:
         print("Won't delete all versions. Please do this manually")
     else:
-        path_to_config_file = os.path.join(src, config_file)
-        cfg = read_cfg(path_to_config_file, profile_name)
+        cfg = read_cfg(src, config_file, profile_name)
 
         profile_name = cfg.get('profile')
         aws_access_key_id = cfg.get('aws_access_key_id')
@@ -96,8 +95,7 @@ def deploy(
         well (and/or is not available on PyPi)
     """
     # Load and parse the config file.
-    path_to_config_file = os.path.join(src, config_file)
-    cfg = read_cfg(path_to_config_file, profile_name)
+    cfg = read_cfg(src, config_file, profile_name)
 
     # Copy all the pip dependencies required to run your code into a temporary
     # folder then add the handler file in the root of this directory.
@@ -129,8 +127,7 @@ def deploy_s3(
         well (and/or is not available on PyPi)
     """
     # Load and parse the config file.
-    path_to_config_file = os.path.join(src, config_file)
-    cfg = read_cfg(path_to_config_file, profile_name)
+    cfg = read_cfg(src, config_file, profile_name)
 
     # Copy all the pip dependencies required to run your code into a temporary
     # folder then add the handler file in the root of this directory.
@@ -163,8 +160,7 @@ def upload(
         well (and/or is not available on PyPi)
     """
     # Load and parse the config file.
-    path_to_config_file = os.path.join(src, config_file)
-    cfg = read_cfg(path_to_config_file, profile_name)
+    cfg = read_cfg(src, config_file, profile_name)
 
     # Copy all the pip dependencies required to run your code into a temporary
     # folder then add the handler file in the root of this directory.
@@ -194,8 +190,7 @@ def invoke(
         Whether to print out verbose details.
     """
     # Load and parse the config file.
-    path_to_config_file = os.path.join(src, config_file)
-    cfg = read_cfg(path_to_config_file, profile_name)
+    cfg = read_cfg(src, config_file, profile_name)
 
     # Set AWS_PROFILE environment variable based on `--profile` option.
     if profile_name:
@@ -271,8 +266,7 @@ def build(
         well (and/or is not available on PyPi)
     """
     # Load and parse the config file.
-    path_to_config_file = os.path.join(src, config_file)
-    cfg = read_cfg(path_to_config_file, profile_name)
+    cfg = read_cfg(src, config_file, profile_name)
 
     # Get the absolute path to the output directory and create it if it doesn't
     # already exist.
@@ -681,10 +675,17 @@ def function_exists(cfg, function_name):
     return function_name in functions
 
 
-def read_cfg(path_to_config_file, profile_name):
-    cfg = read(path_to_config_file, loader=yaml.load)
-    if profile_name is not None:
-        cfg['profile'] = profile_name
-    elif 'AWS_PROFILE' in os.environ:
-        cfg['profile'] = os.environ['AWS_PROFILE']
-    return cfg
+def read_cfg(src, config_file_paths, profile_name):
+    if isinstance(config_file_paths, str):
+        # Accept singular string, convert to list:
+        config_file_paths = config_file_paths.split(':')
+    for path in config_file_paths:
+        path = os.path.join(src, path)
+        if os.path.isfile(path):
+            cfg = read(path, loader=yaml.load)
+            if profile_name is not None:
+                cfg['profile'] = profile_name
+            elif 'AWS_PROFILE' in os.environ:
+                cfg['profile'] = os.environ['AWS_PROFILE']
+            return cfg
+    raise FileNotFoundError('Unable to find config file: %s' % ', '.join(config_file_paths))
