@@ -5,25 +5,25 @@ import hashlib
 import json
 import logging
 import os
+import packaging.requirements
+import requests
 import sys
+import tempfile
 import time
+import zipfile
+
 from collections import defaultdict
 from imp import load_source
 from shutil import copy
 from shutil import copyfile
 from shutil import copytree
-from tempfile import mkdtemp
 
 import boto3
 import botocore
 import pip
 import yaml
 
-from .helpers import archive
-from .helpers import get_environment_variable_value
-from .helpers import mkdir
-from .helpers import read
-from .helpers import timestamp
+from .helpers import *
 
 
 ARN_PREFIXES = {
@@ -279,8 +279,9 @@ def build(
     function_name = cfg.get('function_name')
     output_filename = '{0}-{1}.zip'.format(timestamp(), function_name)
 
-    path_to_temp = mkdtemp(prefix='aws-lambda')
+    path_to_temp = tempfile.mkdtemp(prefix='aws-lambda')
     pip_install_to_target(
+        cfg,
         path_to_temp,
         use_requirements=use_requirements,
         local_package=local_package,
@@ -319,7 +320,8 @@ def build(
     files = []
     for filename in os.listdir(src):
         if os.path.isfile(filename):
-            if filename == '.DS_Store':
+            # Ignore Mac OS cache files and Vim swap files:
+            if filename == '.DS_Store' or re.search(r'^\..*\.sw.$', filename):
                 continue
             if filename == config_file:
                 continue
@@ -378,7 +380,7 @@ def get_handler_filename(handler):
     return '{0}.py'.format(module_name)
 
 
-def _install_packages(path, packages):
+def _install_packages(path, packages, python_runtime):
     """Install all packages listed to the target directory.
 
     Ignores any package that includes Python itself and python-lambda as well
@@ -389,19 +391,28 @@ def _install_packages(path, packages):
     :param list packages:
         A list of packages to be installed via pip.
     """
-    def _filter_blacklist(package):
-        blacklist = ['-i', '#', 'Python==', 'python-lambda==']
-        return all(package.startswith(entry) is False for entry in blacklist)
-    filtered_packages = filter(_filter_blacklist, packages)
-    for package in filtered_packages:
-        if package.startswith('-e '):
-            package = package.replace('-e ', '')
+    #def _filter_blacklist(package):
+    #    blacklist = ['-i', '#', 'Python==', 'python-lambda==']
+    #    return all(package.startswith(entry) is False for entry in blacklist)
+    #packages = filter(_filter_blacklist, packages)
+    for package, req in packages.items():
+        #if package.startswith('-e '):
+        #    package = package.replace('-e ', '')
 
-        print('Installing {package}'.format(package=package))
-        pip.main(['install', package, '-t', path, '--ignore-installed'])
+        try:
+            wheel_path = get_cached_manylinux_wheel(package, list(req.specifier)[0].version, python_runtime)
+            print('Installing {} from wheel'.format(package))
+            #shutil.rmtree(os.path.join(path, package), ignore_errors=True)
+            with zipfile.ZipFile(wheel_path) as zfile:
+                zfile.extractall(path)
+        except ValueError as e:
+            # No such wheel, install via pip:
+            print('Installing {} via pip'.format(package))
+            os.environ['RADIX_NO_EXT'] = '1'
+            pip.main(['install', package, '-t', path, '--ignore-installed'])
 
 
-def pip_install_to_target(path, use_requirements=False, local_package=None):
+def pip_install_to_target(cfg, path, use_requirements=False, local_package=None):
     """For a given active virtualenv, gather all installed pip packages then
     copy (re-install) them to the path provided.
 
@@ -417,15 +428,34 @@ def pip_install_to_target(path, use_requirements=False, local_package=None):
         The path to a local package with should be included in the deploy as
         well (and/or is not available on PyPi)
     """
-    packages = []
+    installed_packages = {
+        p.project_name: p.as_requirement()
+        for p in pip.get_installed_distributions()
+    }
+
+    packages = {}
     if not use_requirements:
         print('Gathering pip packages')
-        packages.extend(pip.operations.freeze.freeze())
+        packages.update(installed_packages)
     else:
         if os.path.exists('requirements.txt'):
             print('Gathering requirement packages')
+            blacklist = ['-i', '#', 'Python==', 'python-lambda==']
             data = read('requirements.txt')
-            packages.extend(data.splitlines())
+            for line in data.splitlines():
+                if any(line.startswith(black) for black in blacklist): continue
+                if line.startswith('-e '):
+                    line = line.replace('-e ', '')
+
+                req = packaging.requirements.Requirement(line)
+                if len(req.specifier) != 1 or list(req.specifier)[0].operator != '==':
+                    # No version specified, use version currently installed:
+                    try:
+                        req.specifier = installed_packages[req.name].specifier
+                    except KeyError:
+                        print('WARNING: Unable to resolve version for requirement "{}"; please pip install first.'.format(line))
+                        continue
+                packages[req.name] = req
 
     if not packages:
         print('No dependency packages installed!')
@@ -433,9 +463,12 @@ def pip_install_to_target(path, use_requirements=False, local_package=None):
     if local_package is not None:
         if not isinstance(local_package, (list, tuple)):
             local_package = [local_package]
-        for l_package in local_package:
-            packages.append(l_package)
-    _install_packages(path, packages)
+        packages.update({
+            req.name: req
+            for req in [packaging.requirements.Requirement(p) for p in local_package]
+        })
+
+    _install_packages(path, packages, cfg.get('runtime', 'python2.7'))
 
 
 def get_role_name(region, account_id, role):
@@ -582,7 +615,7 @@ def update_function(cfg, path_to_zip_file, *use_s3, **s3_file):
     kwargs = {
         'FunctionName': cfg.get('function_name'),
         'Role': role,
-        'Runtime': cfg.get('runtime'),
+        'Runtime': cfg.get('runtime', 'python2.7'),
         'Handler': cfg.get('handler'),
         'Description': cfg.get('description'),
         'Timeout': cfg.get('timeout', 15),
@@ -689,3 +722,118 @@ def read_cfg(src, config_file_paths, profile_name):
                 cfg['profile'] = os.environ['AWS_PROFILE']
             return cfg
     raise FileNotFoundError('Unable to find config file: %s' % ', '.join(config_file_paths))
+
+
+def manylinux_wheel_file_suffix(python_runtime):
+    if python_runtime == 'python2.7':
+        return 'cp27mu-manylinux1_x86_64.whl'
+    elif python_runtime == 'python3.6':
+        return 'cp36m-manylinux1_x86_64.whl'
+    else:
+        raise ValueError('Unknown Python runtime: {}'.format(python_runtime))
+
+
+# Borrowed from <https://github.com/Miserlou/Zappa/blame/4d2d40cf7/zappa/core.py#L802-L828>.
+# (C) Rich "Miserlou" Jones and respective authors | License: MIT
+def get_cached_manylinux_wheel(package_name, package_version, python_runtime, show_progress=True):
+    """
+    Gets the locally stored version of a manylinux wheel. If one does not exist, the function downloads it.
+    """
+    cached_wheels_dir = os.path.join(tempfile.gettempdir(), 'cached_wheels')
+    if not os.path.isdir(cached_wheels_dir):
+        os.makedirs(cached_wheels_dir)
+
+    wheel_file_suffix = manylinux_wheel_file_suffix(python_runtime)
+    wheel_file = '{0!s}-{1!s}-{2!s}'.format(package_name, package_version, wheel_file_suffix)
+    wheel_path = os.path.join(cached_wheels_dir, wheel_file)
+
+    if not os.path.exists(wheel_path) or not zipfile.is_zipfile(wheel_path):
+        # The file is not cached, download it.
+        wheel_url = get_manylinux_wheel_url(package_name, package_version, wheel_file_suffix)
+
+        print(" - {}=={}: Downloading".format(package_name, package_version))
+        with open(wheel_path, 'wb') as f:
+            download_url_to_stream(wheel_url, f, show_progress)
+
+        if not zipfile.is_zipfile(wheel_path):
+            raise Exception('Wheel downloaded from PyPI is not a ZIP file: {}'.format(wheel_path))
+    else:
+        print(" - {}=={}: Using locally cached manylinux wheel".format(package_name, package_version))
+
+    return wheel_path
+
+
+# Borrowed from <https://github.com/Miserlou/Zappa/blame/4d2d40cf7/zappa/core.py#L830-L873>.
+# (C) Rich "Miserlou" Jones and respective authors | License: MIT
+def get_manylinux_wheel_url(package_name, package_version, wheel_file_suffix):
+    """
+    For a given package name, returns a link to the download URL,
+    else returns None.
+
+    This function downloads metadata JSON of `package_name` from Pypi
+    and examines if the package has a manylinux wheel. This function
+    also caches the JSON file so that we don't have to poll Pypi
+    every time.
+    """
+    cached_pypi_info_dir = os.path.join(tempfile.gettempdir(), 'cached_pypi_info')
+    if not os.path.isdir(cached_pypi_info_dir):
+        os.makedirs(cached_pypi_info_dir)
+    # Even though the metadata is for the package, we save it in a
+    # filename that includes the package's version. This helps in
+    # invalidating the cached file if the user moves to a different
+    # version of the package.
+    json_file = '{0!s}-{1!s}.json'.format(package_name, package_version)
+    json_file_path = os.path.join(cached_pypi_info_dir, json_file)
+    if os.path.exists(json_file_path):
+        with open(json_file_path, mode='r', encoding='utf-8') as metafile:
+            data = json.load(metafile)
+    else:
+        url = 'https://pypi.python.org/pypi/{}/json'.format(package_name)
+        try:
+            res = requests.get(url, timeout=1.5)
+            data = res.json()
+        except Exception as e:
+            raise IOError('Unable to download package metadata from {}: {}'.format(url, e))
+        with open(json_file_path, mode='w', encoding='utf-8') as metafile:
+            jsondata = json.dumps(data)
+            metafile.write(jsondata)
+
+    if package_version not in data['releases']:
+        raise ValueError('PyPI has no release for package: {}=={}'.format(package_name, package_version))
+
+    for f in data['releases'][package_version]:
+        if f['filename'].endswith(wheel_file_suffix):
+            return f['url']
+
+    raise ValueError('PyPI has no wheel for package: {}=={} *.{}'.format(
+        package_name, package_version, wheel_file_suffix))
+
+
+# Borrowed from <https://github.com/Miserlou/Zappa/blame/95a8e0860/zappa/core.py#L746-L765>.
+# (C) Rich "Miserlou" Jones and respective authors | License: MIT
+#def get_installed_packages():
+#    """
+#    Returns a dict of installed packages that Zappa cares about.
+#    """
+#    import pip  # this is to avoid 'funkiness' with global import
+#
+#    python_runtime = 'python{}.{}'.format(sys.version_info.major, sys.version_info.minor)
+#    site_packages    = os.path.join(venv, 'lib',   python_runtime, 'site-packages')
+#    site_packages_64 = os.path.join(venv, 'lib64', python_runtime, 'site-packages')
+#
+#    packages_to_keep = []
+#    if os.path.isdir(site_packages):
+#        packages_to_keep += os.listdir(site_packages)
+#    if os.path.isdir(site_packages_64):
+#        packages_to_keep += os.listdir(site_packages_64)
+#
+#    packages_to_keep = [package.lower() for package in packages_to_keep]
+#
+#    installed_packages = {
+#        package.project_name.lower(): package.version
+#        for package in pip.get_installed_distributions()
+#        if package.project_name.lower() in packages_to_keep or
+#           package.location in [site_packages, site_packages_64]
+#    }
+#
+#    return installed_packages

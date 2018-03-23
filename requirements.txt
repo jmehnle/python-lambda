@@ -8,3 +8,4 @@ pyaml==15.8.2
 python-dateutil==2.5.3
 PyYAML==3.11
 six==1.10.0
+tqdm==4.19.5

@@ -2,6 +2,8 @@
 import datetime as dt
 import os
 import re
+import requests
+import tqdm
 import zipfile
 
 
@@ -41,3 +43,20 @@ def get_environment_variable_value(val):
         if match is not None:
             env_val = os.environ.get(match.group('environment_key_name'))
     return env_val
+
+
+def download_url_to_stream(url, stream, show_progress=True):
+    """
+    Downloads a given url in chunks and writes to the provided stream (can be any io stream).
+    Displays the progress bar for the download.
+    """
+    resp = requests.get(url, timeout=2, stream=True)
+    resp.raw.decode_content = True
+
+    progress = tqdm.tqdm(unit="B", unit_scale=True, total=int(resp.headers.get('Content-Length', 0)), disable=not show_progress)
+    for chunk in resp.iter_content(chunk_size=1024):
+        if chunk:
+            progress.update(len(chunk))
+            stream.write(chunk)
+
+    progress.close()
